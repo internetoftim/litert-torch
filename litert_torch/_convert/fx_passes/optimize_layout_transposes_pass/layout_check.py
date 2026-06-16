@@ -158,6 +158,8 @@ def _qdq_layout_sensitive_inputs_getter(node: Node):
 )
 @layout_sensitive_inputs_getters.register(aten.group_norm)
 @layout_sensitive_inputs_getters.register(aten.native_group_norm)
+@layout_sensitive_inputs_getters.register(aten.reflection_pad2d)
+@layout_sensitive_inputs_getters.register(aten.replication_pad2d)
 def _first_arg_getter(node):
   return [node.args[0]]
 
@@ -173,6 +175,8 @@ def _first_arg_getter(node):
 @nhwcable_node_checkers.register(aten._adaptive_avg_pool2d)
 @nhwcable_node_checkers.register(aten.conv2d)
 @nhwcable_node_checkers.register(aten.convolution)
+@nhwcable_node_checkers.register(aten.reflection_pad2d)
+@nhwcable_node_checkers.register(aten.replication_pad2d)
 def _all_layout_sensitive_inputs_are_4d_checker(node: Node):
   can_be = all_layout_sensitive_inputs_are_4d(node)
   return NHWCable(can_be, must_be=can_be)

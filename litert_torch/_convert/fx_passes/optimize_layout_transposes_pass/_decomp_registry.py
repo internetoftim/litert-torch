@@ -27,6 +27,7 @@ _OPS_TO_KEEP = [
     aten.group_norm.default,
     aten.native_group_norm.default,
     aten.reflection_pad2d.default,
+    aten.replication_pad2d.default,
 ]
 
 for op in _OPS_TO_KEEP:

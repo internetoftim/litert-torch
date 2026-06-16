@@ -88,10 +88,8 @@ fx_infra.decomp.update_pre_lower_decomp(
         torch.ops.aten.native_group_norm,
         torch.ops.aten.native_dropout,
         torch.ops.aten.reflection_pad1d,
-        torch.ops.aten.reflection_pad2d,
         torch.ops.aten.reflection_pad3d,
         torch.ops.aten.replication_pad1d,
-        torch.ops.aten.replication_pad2d,
         torch.ops.aten.replication_pad3d,
         torch.ops.aten.upsample_bilinear2d.vec,
         torch.ops.aten.addmm,
@@ -122,6 +120,8 @@ def get_scale_value(scales, idx):
 
 
 fx_infra.decomp.remove_pre_lower_decomp(torch.ops.aten.roll)
+fx_infra.decomp.remove_pre_convert_decomp(torch.ops.aten.reflection_pad2d)
+fx_infra.decomp.remove_pre_convert_decomp(torch.ops.aten.replication_pad2d)
 
 # Torch's default einsum impl/decompositions is less efficient and
 # optimized through converter than JAX's impl. Disable einsum

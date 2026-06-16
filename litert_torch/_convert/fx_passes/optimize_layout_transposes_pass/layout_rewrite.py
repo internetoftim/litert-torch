@@ -450,10 +450,21 @@ def _aten_index(node):
   node.target = index_nhwc
 
 
+def reflection_pad2d_nhwc(x, padding):
+  padding = [0, 0] + padding
+  return torch.nn.functional.pad(x, padding, mode="reflect")
+
+
 @rewriters.register(aten.reflection_pad2d.default)
 def _aten_reflection_pad2d(node):
-  def reflection_pad2d_nhwc(x, padding):
-    padding = [0, 0] + padding
-    return torch.nn.functional.pad(x, padding, mode="reflect")
-
   node.target = reflection_pad2d_nhwc
+
+
+def replication_pad2d_nhwc(x, padding):
+  padding = [0, 0] + padding
+  return torch.nn.functional.pad(x, padding, mode="replicate")
+
+
+@rewriters.register(aten.replication_pad2d.default)
+def _aten_replication_pad2d(node):
+  node.target = replication_pad2d_nhwc
