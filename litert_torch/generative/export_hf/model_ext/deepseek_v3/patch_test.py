@@ -31,69 +31,10 @@ from litert_torch.generative.export_hf.core import exportable_module
 from litert_torch.generative.export_hf.core import exportable_module_config
 from litert_torch.generative.export_hf.model_ext import patches as patches_lib
 from litert_torch.generative.export_hf.model_ext.deepseek_v3 import patch
+from litert_torch.generative.export_hf.model_ext.deepseek_v3 import test_utils
 from absl.testing import parameterized
 
 from absl.testing import absltest as googletest
-
-
-def _tiny_deepseek_v3_config(**overrides):
-  """Tiny random-weight DeepSeek-V3 config.
-
-  Mirrors the Moonlight-16B-A3B architecture knobs at toy scale, keeping the
-  properties that matter for export parity: asymmetric head dims
-  (qk_head_dim != v_head_dim), MLA kv down-projection, one dense layer
-  followed by one MoE layer, sigmoid `noaux_tc` routing with n_group=1, two
-  shared experts, and interleaved RoPE.
-  """
-  kwargs = dict(
-      vocab_size=256,
-      hidden_size=256,
-      intermediate_size=512,
-      moe_intermediate_size=64,
-      num_hidden_layers=2,
-      num_attention_heads=4,
-      num_key_value_heads=4,
-      head_dim=16,  # Rotary dim; equals qk_rope_head_dim as in Moonlight.
-      qk_nope_head_dim=32,
-      qk_rope_head_dim=16,
-      v_head_dim=32,
-      kv_lora_rank=64,
-      q_lora_rank=None,
-      n_routed_experts=8,
-      num_experts_per_tok=3,
-      n_shared_experts=2,
-      n_group=1,
-      topk_group=1,
-      norm_topk_prob=True,
-      routed_scaling_factor=2.5,
-      first_k_dense_replace=1,
-      hidden_act="silu",
-      rope_interleave=True,
-      rms_norm_eps=1e-5,
-      attention_bias=False,
-      attention_dropout=0.0,
-      max_position_embeddings=128,
-      rope_theta=50000.0,
-      pad_token_id=0,
-      tie_word_embeddings=False,
-      use_cache=True,
-  )
-  kwargs.update(overrides)
-  return modeling_deepseek_v3.DeepseekV3Config(**kwargs)
-
-
-def _create_causal_mask(
-    seq_len: int, cache_length: int, input_pos: torch.Tensor
-) -> torch.Tensor:
-  """Float causal mask of shape (1, 1, seq_len, cache_length)."""
-  cache_positions = torch.arange(cache_length).view(1, 1, 1, cache_length)
-  q_pos = input_pos.view(1, 1, seq_len, 1)
-  causal_bool = cache_positions <= q_pos
-  return torch.where(
-      causal_bool,
-      torch.zeros((1,), dtype=torch.float32),
-      torch.full((1,), -1e38, dtype=torch.float32),
-  )
 
 
 def _dense_router_weights(
@@ -123,7 +64,9 @@ class RouterParityTest(parameterized.TestCase):
   )
   def test_router_parity(self, n_group, topk_group):
     torch.manual_seed(0)
-    config = _tiny_deepseek_v3_config(n_group=n_group, topk_group=topk_group)
+    config = test_utils.tiny_deepseek_v3_config(
+        n_group=n_group, topk_group=topk_group
+    )
 
     original = modeling_deepseek_v3.DeepseekV3TopkRouter(config)
     with torch.no_grad():
@@ -163,7 +106,7 @@ class MoeBlockParityTest(googletest.TestCase):
 
   def test_moe_block_parity_with_sequential_experts(self):
     torch.manual_seed(1)
-    ref_config = _tiny_deepseek_v3_config()
+    ref_config = test_utils.tiny_deepseek_v3_config()
     ref_config._experts_implementation = None  # pylint: disable=protected-access
     ref_moe = modeling_deepseek_v3.DeepseekV3MoE(ref_config)
     with torch.no_grad():
@@ -201,7 +144,7 @@ class ModelParityTest(googletest.TestCase):
 
   def _build_models(self):
     torch.manual_seed(2)
-    ref_config = _tiny_deepseek_v3_config()
+    ref_config = test_utils.tiny_deepseek_v3_config()
     ref_config._attn_implementation = "eager"  # pylint: disable=protected-access
     ref_config._experts_implementation = None  # pylint: disable=protected-access
     ref_model = modeling_deepseek_v3.DeepseekV3ForCausalLM(ref_config)
@@ -281,7 +224,7 @@ class ModelParityTest(googletest.TestCase):
         "kv_cache"
     ]
     input_pos = torch.arange(self.PREFILL_LENGTH, dtype=torch.int32)
-    mask = _create_causal_mask(
+    mask = test_utils.create_causal_mask(
         self.PREFILL_LENGTH, self.CACHE_LENGTH, input_pos
     )
     with torch.no_grad():
@@ -308,7 +251,7 @@ class ModelParityTest(googletest.TestCase):
     kv_cache_b = prefill_out["kv_cache"]
 
     decode_pos = torch.tensor([self.PREFILL_LENGTH], dtype=torch.int32)
-    decode_mask = _create_causal_mask(1, self.CACHE_LENGTH, decode_pos)
+    decode_mask = test_utils.create_causal_mask(1, self.CACHE_LENGTH, decode_pos)
     with torch.no_grad():
       decode_out = gen_mod(
           tokens=next_token,
