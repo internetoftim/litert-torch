@@ -1,4 +1,4 @@
-# deepseek_v3 model_ext — status notes (Kimi/Moonlight port, M1)
+# deepseek_v3 model_ext — status notes (Kimi/Moonlight port, M1+M2)
 
 Target model: `moonshotai/Moonlight-16B-A3B-Instruct` (HF `model_type`
 `deepseek_v3`, `DeepseekV3ForCausalLM`). Verified against the actual hub
@@ -51,13 +51,87 @@ config: `n_group=1`, `topk_group=1`, `num_experts_per_tok=6`,
   `litert_torch.dynamic_update_slice`) are the same categories other
   supported models leave for the later lowering stages.
 
-## Known limitations / out of M1 scope
+## What is implemented (M2)
 
-- **No `.tflite`/`.litertlm` conversion yet** — that is M2 (toy 2-layer
-  export with `litert_moe_sequential` first, then the `moe` custom op
-  experiment; the custom op currently hardcodes gelu + renormalized weights
-  and fp32/int8 only, while DeepSeek needs SiLU + sigmoid-scaled
-  non-renormalized weights).
+- **Working toy `.tflite`** through `export_lib`'s real converter path
+  (`converter_utils.Converter` + `add_signature` + `convert`, i.e.
+  `export_lib.export_text_prefill_decode_model`), on the tiny random-weight
+  config with `moe_exports_implementation="litert_moe_sequential"`. One
+  flatbuffer, two signatures: `prefill_8` (outputs the updated K/V caches
+  only — no logits) and `decode` (caches + logits). ~5.3 MB fp32; converts
+  in seconds on CPU. **No converter blockers** — no missing op lowerings,
+  no crash on the MoE subgraph.
+- `convert_test.py`: converts once, then verifies with the
+  `ai_edge_litert` interpreter against the *unpatched eager*
+  `DeepseekV3ForCausalLM` reference (fp32 CPU). Skips gracefully when the
+  converter deps (`ai-edge-litert`, `ai-edge-quantizer`, `litert-converter`)
+  are not installed. Measured on the toy config:
+  - fp32: decode-step logits max abs diff **4.8e-7**; prefill K/V cache
+    (filled region) max abs diff **≤3.6e-7** per layer. (The unfilled cache
+    region is don't-care — it keeps whatever the input cache held.)
+  - int8 `dynamic_wi8_afp32` (the repo's standard dynamic-range recipe,
+    default of `ExportableModuleConfig.quantization_recipe`): same decode
+    step max abs diff **2.5e-2**; model shrinks 5.08 → 1.60 MiB (3.2x).
+    Expected quantization error, quantified only.
+- `test_utils.py`: shared tiny-config + causal-mask helpers used by both
+  `patch_test.py` and `convert_test.py`.
+
+## M2 `moe` custom-op probe (go/no-go input for M4)
+
+Probed with `moe_exports_implementation="litert_moe"` on the same toy config
+(ai-edge-litert-nightly 2.2.0.dev20260807, macOS arm64):
+
+- **Conversion works** once one repo-side gap is patched:
+  `litert_moe_experts_forward` (`generative/layers/moe.py` line ~452) reads
+  `self.config.top_k_experts` (gemma4 naming); `DeepseekV3Config` calls it
+  `num_experts_per_tok`, so an alias (`config.top_k_experts =
+  config.num_experts_per_tok`) is needed. The HF `DeepseekV3Experts` tensor
+  layout (`gate_up_proj [E, 2I, H]`, `down_proj [E, H, I]`) is directly
+  compatible with `flatten_expert_weight`.
+- **The runtime kernel exists and runs** — the classic
+  `ai_edge_litert.interpreter.Interpreter` resolves and executes the `moe`
+  custom op (fp32 CPU/XNNPACK path in `libLiteRt.dylib`), and
+  `CompiledModel` loads it too. It is NOT closed: source is public in
+  `google-ai-edge/LiteRT`:
+  - CPU: `tflite/delegates/xnnpack/moe_delegate_kernel.cc` — fp32 weights
+    only, **rejects any `activation` other than `'gelu'` at prepare time**
+    (verified empirically: binary-patching the flexbuffer to
+    `activation='silu'` fails with `moe node #149 only supports
+    activation='gelu'`), and does **not** read `renormalized_top_weights`
+    at all — top weights are used exactly as passed.
+  - GPU (ML Drift): `ml_drift_delegate/delegate/composite/
+    moe_experts_parser.cc` — also gelu-only, additionally *requires*
+    `renormalized_top_weights=true`, and accepts
+    `weight_type ∈ {fp32, int8, int4}` (an int4 path exists here, revising
+    M0's "no int4"; the authoring wrapper in `moe.py` still only emits
+    fp32/int8).
+- **Numerics confirm the gelu semantics**: toy decode logits vs the eager
+  SiLU reference differ by **2.4e-2**, but vs a GELU(tanh)-substituted
+  reference by **1.7e-5** — i.e. the CPU kernel computes
+  `gelu_tanh(gate) * up` and applies our sigmoid-scaled, non-renormalized
+  top weights (incl. `routed_scaling_factor`) unchanged. So for DeepSeek the
+  *only* semantic gap on the CPU path is the activation function.
+- **What would need to change for DeepSeek semantics:**
+  1. LiteRT kernels (upstream `google-ai-edge/LiteRT`): accept
+     `activation='silu'` in `moe_delegate_kernel.cc` (CPU) and
+     `moe_experts_parser.cc`/kernel (GPU); the GPU path must also either
+     honor `renormalized_top_weights=false` or drop the hard requirement.
+  2. This repo: parameterize `"activation"` and `"renormalized_top_weights"`
+     in `_moe_custom_options` (`generative/layers/moe.py` lines ~141-151),
+     thread them through `moe_experts`/`litert_moe_experts_forward` from the
+     experts module's `act_fn`/config, fix the `top_k_experts` vs
+     `num_experts_per_tok` naming, and use the real activation in
+     `_moe_experts_reference` (currently hardcoded
+     `F.gelu(approximate="tanh")`, line ~125).
+  Until the upstream kernel change lands, the shipping path for DeepSeek
+  remains `litert_moe_sequential` (correct but dense → 2-4 tok/s class
+  unpruned) or a REAP-pruned model on the same dense path.
+
+## Known limitations / out of M1+M2 scope
+
+- **No `.litertlm` bundling / on-device run yet** — M2 produced and verified
+  the raw `.tflite` on host CPU only; tokenizer/bundle plumbing and the
+  full-size convert are M3.
 - **Latent (rank-512) KV caching not implemented** — the naive cache costs
   ~8.9x the latent size (~1.13 GB fp16 at 4K context for Moonlight-16B).
 - **Split-cache variant untested** for deepseek_v3
@@ -70,14 +144,18 @@ config: `n_group=1`, `topk_group=1`, `num_experts_per_tok=6`,
   value-head-dim reshape fix but have not been exercised with asymmetric
   head dims.
 
-## Environment used for the parity run
+## Environment used for the parity + conversion runs
 
 Python 3.11, `torch==2.12.0`, `transformers==5.14.1` (has native
 `deepseek_v3` with the modern `DeepseekV3Experts` 3D-weight layout +
-`use_experts_implementation` dispatch), fp32 CPU.
+`use_experts_implementation` dispatch), fp32 CPU. Conversion additionally:
+`ai-edge-litert-nightly==2.2.0.dev20260807`,
+`ai-edge-quantizer-nightly==0.9.0.dev20260808`, `litert-converter==0.3.0`
+(macOS arm64 wheels).
 
-Test command:
+Test commands:
 
 ```
 pytest litert_torch/generative/export_hf/model_ext/deepseek_v3/patch_test.py
+pytest litert_torch/generative/export_hf/model_ext/deepseek_v3/convert_test.py
 ```
