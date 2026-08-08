@@ -186,8 +186,13 @@ def transposed_attention(
         is_global=is_global,
         sdpa_use_composite=sdpa_use_composite,
     )
-    # b, kg, t, h
-    sdpa_out = sdpa_out.reshape(b, -1, seq_len, h).permute(0, 2, 1, 3)
+    # b, kg, t, h_v. The output head dim comes from the value tensor, which
+    # may differ from the query head dim (e.g. DeepSeek-V3 MLA has
+    # qk_head_dim=192 but v_head_dim=128), so derive it from the sdpa output
+    # shape instead of reusing the query head dim.
+    sdpa_out = sdpa_out.reshape(b, -1, seq_len, sdpa_out.shape[-1]).permute(
+        0, 2, 1, 3
+    )
     return sdpa_out, None
 
   # 1, bk, gt, h
@@ -202,8 +207,11 @@ def transposed_attention(
       scale=scaling,
       softcap=softcap,
   )
-  # b, kg, t, h
-  sdpa_out = sdpa_out.reshape(b, -1, seq_len, h).permute(0, 2, 1, 3)
+  # b, kg, t, h_v. See the comment above: the output head dim is the value
+  # head dim, which may differ from the query head dim.
+  sdpa_out = sdpa_out.reshape(b, -1, seq_len, sdpa_out.shape[-1]).permute(
+      0, 2, 1, 3
+  )
   return sdpa_out, None
 
 

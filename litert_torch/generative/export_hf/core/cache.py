@@ -270,6 +270,11 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
     self.batch_size = batch_size
     v_head_dim_idx = 3 if self.v_ts_idx == 2 else 2
     self.head_dim = self.v_cache_shape[v_head_dim_idx]
+    # Key and value head dims may differ (e.g. DeepSeek-V3 MLA uses
+    # qk_head_dim=192 vs v_head_dim=128), so derive the K head dim from the
+    # key cache shape instead of reusing the value head dim.
+    k_head_dim_idx = 3 if self.k_ts_idx == 2 else 2
+    self.k_head_dim = self.k_cache_shape[k_head_dim_idx]
 
     self.additional_states = kwargs.get("additional_states", None)
 
@@ -314,10 +319,10 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
 
     if not cache_kwargs.get("kv_slice_preprocessed", False):
       if self.k_ts_idx == 3:
-        key_target_shape = (1, -1, self.head_dim, seq_len)
+        key_target_shape = (1, -1, self.k_head_dim, seq_len)
         key_states = key_states.permute(0, 1, 3, 2).reshape(*key_target_shape)
       elif self.k_ts_idx == 2:
-        key_target_shape = (1, -1, seq_len, self.head_dim)
+        key_target_shape = (1, -1, seq_len, self.k_head_dim)
         key_states = key_states.reshape(*key_target_shape)
       else:
         raise ValueError(f"Unsupported k_ts_idx: {self.k_ts_idx}")
@@ -422,18 +427,32 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
             model_config.global_head_dim or embed_size_per_head
         )
 
+    # Models with asymmetric K/V head dims (e.g. DeepSeek-V3 MLA:
+    # qk_head_dim = qk_nope_head_dim + qk_rope_head_dim = 192 while
+    # v_head_dim = 128) expose both dims on the config. In that case the K
+    # cache must be allocated with qk_head_dim and the V cache with
+    # v_head_dim. Note that for such models `head_dim` on the config refers
+    # to the rotary sub-dimension only and must not be used for cache shapes.
+    k_embed_size_per_head = embed_size_per_head
+    v_embed_size_per_head = embed_size_per_head
+    qk_head_dim = getattr(model_config, "qk_head_dim", None)
+    v_head_dim = getattr(model_config, "v_head_dim", None)
+    if qk_head_dim and v_head_dim:
+      k_embed_size_per_head = qk_head_dim
+      v_embed_size_per_head = v_head_dim
+
     if k_ts_idx == 2:
       k_cache_shape = (
           1,
           batch_size * num_kv_heads,
           cache_length,
-          embed_size_per_head,
+          k_embed_size_per_head,
       )
     elif k_ts_idx == 3:
       k_cache_shape = (
           1,
           batch_size * num_kv_heads,
-          embed_size_per_head,
+          k_embed_size_per_head,
           cache_length,
       )
     else:
@@ -443,13 +462,13 @@ class LiteRTLMCacheLayer(cache_base_lib.LiteRTLMCacheLayerMixin):
           1,
           batch_size * num_kv_heads,
           cache_length,
-          embed_size_per_head,
+          v_embed_size_per_head,
       )
     elif v_ts_idx == 3:
       v_cache_shape = (
           1,
           batch_size * num_kv_heads,
-          embed_size_per_head,
+          v_embed_size_per_head,
           cache_length,
       )
     else:
